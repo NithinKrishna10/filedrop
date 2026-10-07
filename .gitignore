@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.env
+venv/
+.venv/
+
+# Uploaded zips: the directory is tracked (via .gitkeep) but never its contents.
+# These rules live here rather than in storage/.gitignore, because a pattern of
+# "*" in that file also matches the file itself, so it could never be committed
+# and a fresh clone was left with no rule at all.
+storage/*
+!storage/.gitkeep

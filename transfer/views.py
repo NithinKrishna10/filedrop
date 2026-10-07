@@ -1,0 +1,217 @@
+"""
+Upload, list and download the transfer zips.
+
+One flat directory, one file per name. Uploading a name that already exists
+replaces it, so the download link for e.g. backend-zip.zip never changes.
+"""
+import hashlib
+import os
+import re
+from datetime import datetime, timezone
+
+from django.conf import settings
+from django.http import FileResponse, JsonResponse
+from django.views.decorators.csrf import csrf_exempt
+from django.views.decorators.http import require_http_methods
+
+from .auth import require_api_key
+
+# Deliberately strict: no directory separators, no leading dot, nothing that
+# could walk out of STORAGE_DIR. Anything else is rejected rather than cleaned,
+# so a surprising name fails loudly instead of being silently renamed.
+SAFE_NAME = re.compile(r'^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$')
+
+SHA_SUFFIX = '.sha256'
+PART_SUFFIX = '.part'
+
+
+def _storage_dir():
+    settings.STORAGE_DIR.mkdir(parents=True, exist_ok=True)
+    return settings.STORAGE_DIR
+
+
+def _reject_name(name):
+    """None if the name is usable, else a JsonResponse explaining why not."""
+    if not name:
+        return JsonResponse({"error": "A file name is required."}, status=400)
+    if '..' in name or '/' in name or '\\' in name or not SAFE_NAME.match(name):
+        return JsonResponse(
+            {"error": "Invalid name. Use letters, digits, dot, dash and underscore only."},
+            status=400,
+        )
+    if name.endswith(SHA_SUFFIX) or name.endswith(PART_SUFFIX):
+        return JsonResponse({"error": "That suffix is reserved."}, status=400)
+    if settings.ALLOWED_EXTENSIONS and not name.lower().endswith(settings.ALLOWED_EXTENSIONS):
+        allowed = ', '.join(settings.ALLOWED_EXTENSIONS)
+        return JsonResponse({"error": f"Only these extensions are allowed: {allowed}"}, status=400)
+    return None
+
+
+def _resolved_path(name):
+    """
+    The path for a validated name, confirmed to sit inside STORAGE_DIR.
+
+    SAFE_NAME already rules out traversal; this is the belt-and-braces check, so
+    a future change to the pattern cannot turn into a path-traversal bug.
+    """
+    base = _storage_dir().resolve()
+    path = (base / name).resolve()
+    if path.parent != base:
+        raise ValueError("resolved outside the storage directory")
+    return path
+
+
+def _sidecar(path):
+    return path.with_name(path.name + SHA_SUFFIX)
+
+
+def _read_sha(path):
+    side = _sidecar(path)
+    if side.exists():
+        try:
+            return side.read_text(encoding='ascii').strip() or None
+        except OSError:
+            return None
+    return None
+
+
+def _describe(path, request=None):
+    stat = path.stat()
+    info = {
+        "name": path.name,
+        "size": stat.st_size,
+        "modified": datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc).isoformat(),
+        "sha256": _read_sha(path),
+    }
+    if request is not None:
+        info["download_url"] = request.build_absolute_uri(f"/api/download/{path.name}")
+    return info
+
+
+@csrf_exempt
+@require_http_methods(["POST"])
+@require_api_key
+def upload(request):
+    """
+    POST /api/upload/   multipart form, field "file"
+
+    The stored name comes from the uploaded file unless "name" is given. Writes
+    to <name>.part first and renames on success, so a failed or half-finished
+    upload leaves the previous good copy intact instead of truncating it.
+    """
+    upload_file = request.FILES.get('file')
+    if not upload_file:
+        return JsonResponse({"error": "No file sent. Use multipart form field 'file'."}, status=400)
+
+    name = request.POST.get('name') or os.path.basename(upload_file.name or '')
+    bad = _reject_name(name)
+    if bad:
+        return bad
+
+    limit = settings.MAX_UPLOAD_BYTES
+    if limit and upload_file.size and upload_file.size > limit:
+        return JsonResponse(
+            {"error": f"File is {upload_file.size} bytes; the limit is {limit}."},
+            status=413,
+        )
+
+    try:
+        final = _resolved_path(name)
+    except ValueError:
+        return JsonResponse({"error": "Invalid name."}, status=400)
+
+    part = final.with_name(final.name + PART_SUFFIX)
+    digest = hashlib.sha256()
+    written = 0
+    try:
+        with open(part, 'wb') as out:
+            for chunk in upload_file.chunks():
+                written += len(chunk)
+                if limit and written > limit:
+                    raise ValueError(f"exceeded {limit} bytes")
+                digest.update(chunk)
+                out.write(chunk)
+        existed = final.exists()
+        # Atomic on the same filesystem, and os.replace overwrites on Windows
+        # too, which os.rename does not.
+        os.replace(part, final)
+        _sidecar(final).write_text(digest.hexdigest(), encoding='ascii')
+    except ValueError as exc:
+        part.unlink(missing_ok=True)
+        return JsonResponse({"error": str(exc)}, status=413)
+    except OSError as exc:
+        part.unlink(missing_ok=True)
+        return JsonResponse({"error": f"Could not store the file: {exc}"}, status=500)
+
+    body = _describe(final, request)
+    body["replaced"] = existed
+    return JsonResponse(body, status=200)
+
+
+@require_http_methods(["GET"])
+@require_api_key
+def listing(request):
+    """GET /api/files/ - newest first, so a client can pick the latest zip."""
+    files = []
+    for path in sorted(_storage_dir().glob('*')):
+        if not path.is_file():
+            continue
+        if path.name.endswith(SHA_SUFFIX) or path.name.endswith(PART_SUFFIX):
+            continue
+        files.append(_describe(path, request))
+    files.sort(key=lambda f: f["modified"], reverse=True)
+    return JsonResponse({"count": len(files), "files": files})
+
+
+@require_http_methods(["GET"])
+@require_api_key
+def download(request, name):
+    """GET /api/download/<name> - streams the file, named as it was uploaded."""
+    bad = _reject_name(name)
+    if bad:
+        return bad
+    try:
+        path = _resolved_path(name)
+    except ValueError:
+        return JsonResponse({"error": "Invalid name."}, status=400)
+    if not path.is_file():
+        return JsonResponse({"error": f"No such file: {name}"}, status=404)
+
+    response = FileResponse(open(path, 'rb'), as_attachment=True, filename=path.name)
+    response['Content-Length'] = path.stat().st_size
+    sha = _read_sha(path)
+    if sha:
+        # Lets the caller verify the transfer without a second request.
+        response['X-Content-SHA256'] = sha
+    return response
+
+
+@csrf_exempt
+@require_http_methods(["DELETE"])
+@require_api_key
+def delete(request, name):
+    """DELETE /api/files/<name>"""
+    bad = _reject_name(name)
+    if bad:
+        return bad
+    try:
+        path = _resolved_path(name)
+    except ValueError:
+        return JsonResponse({"error": "Invalid name."}, status=400)
+    if not path.is_file():
+        return JsonResponse({"error": f"No such file: {name}"}, status=404)
+    path.unlink()
+    _sidecar(path).unlink(missing_ok=True)
+    return JsonResponse({"deleted": name})
+
+
+@require_http_methods(["GET"])
+def health(request):
+    """GET /api/health/ - unauthenticated, for a platform health check."""
+    writable = os.access(str(_storage_dir()), os.W_OK)
+    return JsonResponse({
+        "ok": True,
+        "storage_dir": str(settings.STORAGE_DIR),
+        "storage_writable": writable,
+        "configured": bool(settings.API_KEY and settings.API_SECRET),
+    })
