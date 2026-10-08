@@ -10,10 +10,13 @@ import re
 from datetime import datetime, timezone
 
 from django.conf import settings
-from django.http import FileResponse, JsonResponse
+from django.http import (
+    FileResponse, HttpResponseRedirect, JsonResponse, StreamingHttpResponse,
+)
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
 
+from . import blob
 from .auth import require_api_key
 
 # Deliberately strict: no directory separators, no leading dot, nothing that
@@ -115,6 +118,21 @@ def upload(request):
             status=413,
         )
 
+    # Blob first: _resolved_path() below creates the storage directory, which
+    # throws on a read-only filesystem -- exactly where Blob is being used.
+    if blob.is_enabled():
+        # Vercel caps a function request body at 4.5 MB, so this path only ever
+        # serves small files; the pack script PUTs large zips to Blob directly.
+        raw = b''.join(upload_file.chunks())
+        try:
+            stored = blob.upload(name, raw)
+        except blob.BlobError as exc:
+            return JsonResponse({"error": str(exc)}, status=502)
+        stored["sha256"] = hashlib.sha256(raw).hexdigest()
+        stored["download_url"] = request.build_absolute_uri(f"/api/download/{name}")
+        stored["replaced"] = None   # Blob does not say whether it overwrote
+        return JsonResponse(stored, status=200)
+
     try:
         final = _resolved_path(name)
     except ValueError:
@@ -152,9 +170,27 @@ def upload(request):
 @require_api_key
 def listing(request):
     """GET /api/files/ - newest first, so a client can pick the latest zip."""
+    if blob.is_enabled():
+        try:
+            found = blob.listing()
+        except blob.BlobError as exc:
+            return JsonResponse({"error": str(exc)}, status=502)
+        files = []
+        for f in found:
+            if not f["name"] or _reject_name(f["name"]) is not None:
+                continue
+            f["download_url"] = request.build_absolute_uri(f"/api/download/{f['name']}")
+            files.append(f)
+        return JsonResponse({"count": len(files), "files": files})
+
     files = []
     for path in sorted(_storage_dir().glob('*')):
         if not path.is_file():
+            continue
+        # Anything the download endpoint would refuse must not be advertised
+        # here: .gitkeep was being listed with a download_url that 400s, because
+        # _reject_name turns away leading dots and foreign extensions.
+        if _reject_name(path.name) is not None:
             continue
         if path.name.endswith(SHA_SUFFIX) or path.name.endswith(PART_SUFFIX):
             continue
@@ -170,6 +206,39 @@ def download(request, name):
     bad = _reject_name(name)
     if bad:
         return bad
+    if blob.is_enabled():
+        try:
+            found = blob.find(name)
+        except blob.BlobError as exc:
+            return JsonResponse({"error": str(exc)}, status=502)
+        if not found:
+            return JsonResponse({"error": f"No such file: {name}"}, status=404)
+
+        target = found["download_url"]
+        if not blob.is_private(target):
+            # Public store: redirect, so the bytes never pass through the
+            # function. The URL is public but unguessable.
+            return HttpResponseRedirect(target)
+
+        # Private store: an unauthenticated GET there answers 403, so the
+        # redirect would be useless and we have to relay the bytes. Fine for
+        # modest files; a large zip risks the platform's execution limit, which
+        # is why the pack script fetches straight from the store with the token
+        # instead of coming through here.
+        try:
+            stream, length = blob.open_stream(target)
+        except blob.BlobError as exc:
+            return JsonResponse({"error": str(exc)}, status=502)
+
+        response = StreamingHttpResponse(
+            iter(lambda: stream.read(256 * 1024), b''),
+            content_type='application/zip',
+        )
+        response['Content-Disposition'] = f'attachment; filename="{name}"'
+        if length:
+            response['Content-Length'] = length
+        return response
+
     try:
         path = _resolved_path(name)
     except ValueError:
@@ -194,6 +263,16 @@ def delete(request, name):
     bad = _reject_name(name)
     if bad:
         return bad
+    if blob.is_enabled():
+        try:
+            found = blob.find(name)
+            if not found:
+                return JsonResponse({"error": f"No such file: {name}"}, status=404)
+            blob.delete(found["url"])
+        except blob.BlobError as exc:
+            return JsonResponse({"error": str(exc)}, status=502)
+        return JsonResponse({"deleted": name})
+
     try:
         path = _resolved_path(name)
     except ValueError:
@@ -208,10 +287,24 @@ def delete(request, name):
 @require_http_methods(["GET"])
 def health(request):
     """GET /api/health/ - unauthenticated, for a platform health check."""
-    writable = os.access(str(_storage_dir()), os.W_OK)
-    return JsonResponse({
+    info = {
         "ok": True,
-        "storage_dir": str(settings.STORAGE_DIR),
-        "storage_writable": writable,
+        "backend": settings.STORAGE_BACKEND,
         "configured": bool(settings.API_KEY and settings.API_SECRET),
-    })
+    }
+    if blob.is_enabled():
+        info["blob_token_set"] = bool(settings.BLOB_READ_WRITE_TOKEN)
+        try:
+            found = blob.listing()
+            info["stored"] = len(found)
+            info["storage_writable"] = True
+            if found:
+                info["store_private"] = blob.is_private(found[0].get("url"))
+        except blob.BlobError as exc:
+            info["ok"] = False
+            info["storage_writable"] = False
+            info["error"] = str(exc)
+    else:
+        info["storage_dir"] = str(settings.STORAGE_DIR)
+        info["storage_writable"] = os.access(str(_storage_dir()), os.W_OK)
+    return JsonResponse(info)

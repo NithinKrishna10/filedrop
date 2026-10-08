@@ -54,35 +54,54 @@ All via environment; see `.env.example`.
 |---|---|
 | `FILEDROP_API_KEY` | required |
 | `FILEDROP_API_SECRET` | required |
-| `FILEDROP_STORAGE_DIR` | default `./storage` |
+| `BLOB_READ_WRITE_TOKEN` | set by Vercel when a Blob store is linked; its presence selects the `blob` backend |
+| `FILEDROP_STORAGE_BACKEND` | `disk` or `blob`; inferred from the token above |
+| `FILEDROP_STORAGE_DIR` | default `./storage`; `disk` backend only |
 | `FILEDROP_MAX_UPLOAD_BYTES` | default 512 MB; `0` disables |
 | `FILEDROP_ALLOWED_EXT` | default `.zip`; empty allows any |
 | `DJANGO_ALLOWED_HOSTS` | default `*` |
 
 ## Deploying
 
-### Vercel will not work for this
+There are two storage backends. `BLOB_READ_WRITE_TOKEN` being set selects
+`blob`; otherwise it is `disk`. `GET /api/health/` reports which is active.
 
-Two reasons, both hard limits rather than configuration:
+### Vercel + Blob
 
-1. The filesystem is **read-only** apart from `/tmp`, and `/tmp` does not
-   survive between invocations. There is nowhere to keep the files.
-2. Serverless functions cap the request body at **4.5 MB**. `frontend-zip.zip`
-   is about 40 MB.
+Vercel's filesystem is read-only apart from an ephemeral `/tmp`, so the disk
+backend cannot work there — a 1 KB upload returns 500. Link a **Blob store** to
+the project and `BLOB_READ_WRITE_TOKEN` is set for you, which switches the
+backend automatically.
 
-`vercel.json` is included so you can confirm this for yourself, but uploads will
-fail. To use Vercel you would have to keep the bytes in Vercel Blob (or S3/R2)
-rather than on disk — a different service to the one described here, and happy
-to write that version instead.
+One thing this forces: a Vercel function caps its request body at **4.5 MB**, and
+`frontend-zip.zip` is about 40 MB. So large uploads must not pass through the
+app. `scripts/filedrop.ps1` PUTs **straight to Blob** when a `blob_token` is in
+its config, and `POST /api/upload/` stays only for small files.
 
-### What does work
+Downloads are fine either way: `GET /api/download/<name>` looks the blob up and
+**302s** to its URL, so the bytes never pass through the function.
 
-Anything with a real filesystem. **Render** free tier as an example:
+A **private** store (its host contains `.private.`) answers an unauthenticated
+GET with 403, so the bytes are protected by the token rather than by an
+unguessable URL. The service detects this and relays the download instead of
+redirecting, because a redirect would hand the caller a 403. The script skips
+that relay and fetches from the store directly with the token, so a large zip
+never passes through the function.
+
+With a **public** store the URL is unguessable but needs no credentials, and the
+download is a plain redirect.
+
+### A host with a real disk
+
+Simpler, and what the disk backend is for. **Render** as an example:
 
 - Build: `pip install -r requirements.txt`
 - Start: `gunicorn filedrop.wsgi:application`
 - Env: `FILEDROP_API_KEY`, `FILEDROP_API_SECRET`, `DJANGO_ALLOWED_HOSTS=<your-host>`
 - Add a **disk** and set `FILEDROP_STORAGE_DIR` to its mount path, e.g. `/data`
+
+Nothing else changes, and uploads have no 4.5 MB ceiling, so `blob_token` can be
+left out of the script config entirely.
 
 Without a mounted disk the files are lost on every redeploy, which is survivable
 for a transfer relay but surprising when it happens. Railway, Fly and any VPS

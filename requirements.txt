@@ -1,3 +1,6 @@
 Django>=5.0,<5.3
+# Optional: lets a local .env be picked up. Not needed on a host that sets real
+# environment variables - settings.py skips it if the import fails.
+python-dotenv>=1.0
 # Only needed if you run it with gunicorn (Render, Railway, Fly, a VPS).
 gunicorn>=21.2

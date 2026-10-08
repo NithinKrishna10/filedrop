@@ -10,6 +10,17 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
+# A .env next to manage.py is read if python-dotenv is installed. Optional on
+# purpose: hosts like Render set real environment variables, and a missing
+# package there must not stop the service booting. Real environment variables
+# always win over the file.
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    pass
+else:
+    load_dotenv(BASE_DIR / '.env', override=False)
+
 
 def _env(name, default=None, required=False):
     value = os.environ.get(name, default)
@@ -43,8 +54,22 @@ TIME_ZONE = 'Asia/Kolkata'
 
 # ── filedrop ─────────────────────────────────────────────────────────────────
 
-# Where the zips land. Override on a host whose project directory is read-only
-# or wiped between deploys -- point it at a mounted disk instead.
+# 'disk' or 'blob'. Defaults to blob when a Blob token is present, because the
+# only reason to have one is that the filesystem will not do -- on Vercel it is
+# read-only apart from an ephemeral /tmp.
+BLOB_READ_WRITE_TOKEN = _env('BLOB_READ_WRITE_TOKEN', '')
+STORAGE_BACKEND = _env(
+    'FILEDROP_STORAGE_BACKEND',
+    'blob' if BLOB_READ_WRITE_TOKEN else 'disk',
+).strip().lower()
+if STORAGE_BACKEND not in ('disk', 'blob'):
+    raise RuntimeError("FILEDROP_STORAGE_BACKEND must be 'disk' or 'blob'")
+
+# Vercel's Blob REST API version header. Only change it if Vercel does.
+BLOB_API_VERSION = _env('FILEDROP_BLOB_API_VERSION', '7')
+
+# Where the zips land under the 'disk' backend. Point it at a mounted volume on
+# a host that wipes the project directory between deploys. Ignored for 'blob'.
 STORAGE_DIR = Path(_env('FILEDROP_STORAGE_DIR', str(BASE_DIR / 'storage')))
 
 # The static credentials. Both must be sent on every request.
