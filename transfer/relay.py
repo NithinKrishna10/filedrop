@@ -25,13 +25,15 @@ from functools import wraps
 from pathlib import Path
 
 from django.conf import settings
-from django.http import HttpResponse, JsonResponse
+from django.http import HttpResponse, HttpResponseRedirect, JsonResponse
+from django.utils.html import escape
 from django.views.decorators.csrf import csrf_exempt
 
 from . import blob
 from .auth import require_api_key
 
 SESSION_TTL = 12 * 60 * 60      # a session works for a whole testing day
+PAIR_TTL = 30 * 60              # the 6-digit code typed on the phone is short-lived
 MAX_VALUE_LEN = 500             # permit codes and UUIDs are far shorter
 MAX_BATCH = 10                  # scans returned per poll
 PROBE_LIMIT = 50                # free slots tried when the phone's counter is stale
@@ -122,6 +124,10 @@ def _path(key, n):
     return f'scans/{key}/{n}.json'
 
 
+def _pair_path(code):
+    return f'scans/pair/{code}.json'
+
+
 def _derived_blob_host():
     """
     <storeid>.<access>.blob.vercel-storage.com, from the read-write token
@@ -134,29 +140,38 @@ def _derived_blob_host():
 
 
 def _put(key, n, record):
+    _write(_path(key, n), record)
+
+
+def _get(key, n):
+    """The stored record, or None if slot n is still empty."""
+    return _read(_path(key, n))
+
+
+def _write(rel, record):
     global _blob_host
     data = json.dumps(record).encode('utf-8')
     if blob.is_enabled():
-        stored = blob.upload(_path(key, n), data, content_type='application/json')
+        stored = blob.upload(rel, data, content_type='application/json')
         host = urllib.parse.urlsplit(stored.get('url') or '').hostname
         if host:
             _blob_host = host
         return
-    path = settings.STORAGE_DIR / 'scans' / key / f'{n}.json'
+    path = settings.STORAGE_DIR / rel
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(path.name + '.part')
     tmp.write_bytes(data)
     tmp.replace(path)
 
 
-def _get(key, n):
-    """The stored record, or None if slot n is still empty."""
+def _read(rel):
+    """The JSON stored at rel, or None if there is nothing there yet."""
     if blob.is_enabled():
         host = _blob_host or _derived_blob_host()
         if not host:
             raise blob.BlobError("Could not work out the Blob store's host name.")
         # The query string only defeats any cached "not found" for this path.
-        url = f'https://{host}/{_path(key, n)}?t={time.time_ns()}'
+        url = f'https://{host}/{rel}?t={time.time_ns()}'
         req = urllib.request.Request(url, method='GET')
         req.add_header('authorization', f'Bearer {settings.BLOB_READ_WRITE_TOKEN}')
         try:
@@ -170,7 +185,7 @@ def _get(key, n):
             raise blob.BlobError(f"Could not reach the blob store: {exc.reason}") from exc
         except ValueError:
             return None
-    path = settings.STORAGE_DIR / 'scans' / key / f'{n}.json'
+    path = settings.STORAGE_DIR / rel
     try:
         return json.loads(path.read_bytes())
     except (FileNotFoundError, ValueError):
@@ -207,13 +222,17 @@ def start(request):
         return JsonResponse({"error": "Use POST."}, status=405)
     session = _new_session()
     key = _check_session(session)
+    code = f'{secrets.randbelow(10 ** 6):06d}'
     try:
         _put(key, 0, {"type": "start", "at": time.time()})
+        _write(_pair_path(code), {"session": session, "at": time.time()})
     except (blob.BlobError, OSError) as exc:
         return JsonResponse({"error": f"Could not start a session: {exc}"}, status=502)
     return JsonResponse({
         "session": session,
+        "code": code,
         "phone_url": request.build_absolute_uri(f'/scan/{session}'),
+        "pair_url": request.build_absolute_uri('/scan/'),
         "expires_in": SESSION_TTL,
     })
 
@@ -295,6 +314,61 @@ def phone_page(request, session):
     response = HttpResponse(html, content_type='text/html; charset=utf-8')
     response['Cache-Control'] = 'no-store'
     response['Referrer-Policy'] = 'no-referrer'
+    return response
+
+
+PAIR_HTML = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#2d2b55"><title>CISF Phone Scanner</title>
+<style>
+  body { margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+         background: #0f0e1f; color: #f3f4f6; font: 16px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  form { width: min(92vw, 360px); text-align: center; }
+  h1 { font-size: 20px; margin: 0 0 6px; }
+  p { color: #9ca3af; font-size: 14px; margin: 0 0 20px; }
+  input { width: 100%; box-sizing: border-box; padding: 14px; font: 600 28px ui-monospace, Consolas, monospace;
+          letter-spacing: .35em; text-align: center; border-radius: 14px; border: 1px solid #374151;
+          background: #1b1a35; color: #fff; }
+  button { width: 100%; margin-top: 12px; padding: 14px; font: 600 16px system-ui, sans-serif; border: 0;
+           border-radius: 14px; background: #4ea5e0; color: #fff; }
+  .err { color: #f87171; margin: 12px 0 0; font-size: 14px; }
+</style></head><body>
+<form method="get" action="/scan/">
+  <h1>CISF Phone Scanner</h1>
+  <p>Enter the 6-digit code shown in the extension window on the gate PC.</p>
+  <input name="code" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="one-time-code"
+         placeholder="000000" value="__CODE__" required autofocus>
+  <button type="submit">Connect</button>
+  __ERROR__
+</form></body></html>"""
+
+
+def pair_page(request):
+    """
+    GET /scan/  and  GET /scan/?code=123456
+
+    A fixed address to type on the phone. The code (shown in the extension
+    window) is swapped for that session's camera page.
+    """
+    code = (request.GET.get('code') or '').strip().replace(' ', '')
+    error = ''
+    if code:
+        record = None
+        if len(code) == 6 and code.isdigit():
+            try:
+                record = _read(_pair_path(code))
+            except (blob.BlobError, OSError):
+                error = 'The server could not check that code. Try again.'
+        fresh = record and time.time() - float(record.get('at') or 0) < PAIR_TTL
+        session = record.get('session') if fresh else None
+        if session and _check_session(session):
+            return HttpResponseRedirect(f'/scan/{session}')
+        error = error or 'That code is wrong or has expired. Check the extension window, or click New session there.'
+    html = PAIR_HTML.replace('__CODE__', escape(code)).replace(
+        '__ERROR__', f'<p class="err">{escape(error)}</p>' if error else '')
+    response = HttpResponse(html, status=400 if error else 200)
+    response['Cache-Control'] = 'no-store'
     return response
 
 
