@@ -1,0 +1,260 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#2d2b55">
+<title>CISF Phone Scanner</title>
+<style>
+  :root { --bg: #0f0e1f; --card: #1b1a35; --text: #f3f4f6; --muted: #9ca3af; --primary: #4ea5e0; --ok: #10b981; --err: #f87171; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  header { padding: 14px 16px 10px; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+  header h1 { margin: 0; font-size: 17px; }
+  .pill { font-size: 12px; padding: 3px 10px; border-radius: 999px; background: #374151; color: var(--muted); white-space: nowrap; }
+  .pill.ok { background: rgba(16,185,129,.18); color: var(--ok); }
+  .pill.err { background: rgba(248,113,113,.18); color: var(--err); }
+  main { padding: 0 16px 24px; }
+  .cam { position: relative; width: 100%; aspect-ratio: 3 / 4; max-height: 62vh; background: #000; border-radius: 16px; overflow: hidden; }
+  video { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .frame { position: absolute; inset: 18% 14%; border: 3px solid rgba(255,255,255,.85); border-radius: 18px; box-shadow: 0 0 0 9999px rgba(0,0,0,.35); pointer-events: none; transition: border-color .15s; }
+  .frame.hit { border-color: var(--ok); }
+  .overlay { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px; padding: 20px; text-align: center; background: rgba(0,0,0,.6); }
+  .overlay[hidden] { display: none; }
+  button { font: inherit; font-weight: 600; border: 0; border-radius: 12px; padding: 12px 18px; background: var(--primary); color: #fff; }
+  button.ghost { background: #2b2a4d; color: var(--text); }
+  #msg { margin: 12px 0 0; min-height: 22px; font-size: 14px; color: var(--muted); }
+  #msg.ok { color: var(--ok); } #msg.err { color: var(--err); }
+  .manual { display: flex; gap: 8px; margin-top: 14px; }
+  .manual input { flex: 1; min-width: 0; font: 15px ui-monospace, Consolas, monospace; padding: 11px 12px; border-radius: 12px; border: 1px solid #374151; background: var(--card); color: var(--text); }
+  .row { display: flex; gap: 8px; margin-top: 10px; }
+  .row button { flex: 1; }
+  h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); margin: 18px 0 8px; }
+  ul { list-style: none; margin: 0; padding: 0; }
+  li { display: flex; justify-content: space-between; gap: 10px; padding: 9px 12px; margin-bottom: 6px; background: var(--card); border-radius: 10px; font-size: 13px; }
+  li code { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  li span { color: var(--muted); white-space: nowrap; }
+</style>
+</head>
+<body>
+<header>
+  <h1>CISF Phone Scanner</h1>
+  <span id="conn" class="pill">Connecting…</span>
+</header>
+<main>
+  <div class="cam">
+    <video id="video" muted playsinline autoplay></video>
+    <div id="frame" class="frame"></div>
+    <div id="overlay" class="overlay">
+      <div id="overlayText">Point the camera at the permit QR. Each code is sent to the gate PC.</div>
+      <button id="startBtn">Start camera</button>
+    </div>
+  </div>
+  <div id="msg"></div>
+
+  <div class="row">
+    <button id="flipBtn" class="ghost">Switch camera</button>
+    <button id="pauseBtn" class="ghost">Pause</button>
+  </div>
+
+  <div class="manual">
+    <input id="manual" placeholder="or type a permit code" autocomplete="off" autocapitalize="characters" spellcheck="false">
+    <button id="sendBtn">Send</button>
+  </div>
+
+  <h2>Sent to the gate PC</h2>
+  <ul id="sent"><li><span>Nothing sent yet</span></li></ul>
+</main>
+
+<script>
+(() => {
+  const SESSION = "__SESSION__";
+  const API = `/api/scan/${SESSION}`;
+  const COUNTER_KEY = `scanNext:${SESSION}`;
+  const SAME_VALUE_PAUSE_MS = 3000;   // the QR is still in view: don't send it again
+  const $ = (id) => document.getElementById(id);
+
+  let stream = null, detector = null, paused = false, busy = false;
+  let facing = "environment";
+  let last = { value: "", at: 0 };
+  let next = Number(sessionStorage.getItem(COUNTER_KEY)) || 1;
+  const sent = [];
+
+  const setMsg = (text, kind = "") => { $("msg").textContent = text; $("msg").className = kind; };
+  const setConn = (text, kind = "") => { $("conn").textContent = text; $("conn").className = "pill " + kind; };
+
+  async function push(body) {
+    const res = await fetch(`${API}/push`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...body, next }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `Server answered ${res.status}`);
+    next = data.next;
+    try { sessionStorage.setItem(COUNTER_KEY, String(next)); } catch (e) { /* counter is only a hint */ }
+    return data;
+  }
+
+  async function send(value) {
+    value = String(value || "").trim();
+    if (!value || busy) return;
+    busy = true;
+    $("frame").classList.add("hit");
+    if (navigator.vibrate) navigator.vibrate(80);
+    setMsg(`Sending ${value}…`);
+    try {
+      await push({ value });
+      setMsg(`✓ Sent ${value}`, "ok");
+      setConn("Connected", "ok");
+      sent.unshift({ value, at: new Date() });
+      renderSent();
+    } catch (err) {
+      setMsg(`Not sent: ${err.message}`, "err");
+      setConn("Offline", "err");
+      last = { value: "", at: 0 };   // allow an immediate retry of the same code
+    } finally {
+      busy = false;
+      setTimeout(() => $("frame").classList.remove("hit"), 400);
+    }
+  }
+
+  function renderSent() {
+    const ul = $("sent");
+    ul.innerHTML = "";
+    for (const s of sent.slice(0, 20)) {
+      const li = document.createElement("li");
+      const code = document.createElement("code");
+      code.textContent = s.value;
+      const time = document.createElement("span");
+      time.textContent = s.at.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+      li.append(code, time);
+      ul.append(li);
+    }
+  }
+
+  // ── Camera ────────────────────────────────────────────────────────────────
+  async function startCamera() {
+    if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) {
+      showOverlay("The camera needs this page to be opened over https.", false);
+      return;
+    }
+    stopCamera();
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({
+        video: { facingMode: { ideal: facing }, width: { ideal: 1280 }, height: { ideal: 720 } },
+        audio: false,
+      });
+    } catch (err) {
+      const why = err && err.name === "NotAllowedError"
+        ? "Camera permission was denied. Allow the camera for this site in the browser settings, then tap Start camera."
+        : err && err.name === "NotReadableError"
+          ? "The camera is busy in another app. Close it and tap Start camera."
+          : `Couldn't open the camera: ${err && err.message || err}`;
+      showOverlay(why, true);
+      return;
+    }
+    const video = $("video");
+    video.srcObject = stream;
+    try { await video.play(); } catch (e) { /* autoplay is muted; play() can still race */ }
+    $("overlay").hidden = true;
+    setMsg("Point the camera at the permit QR.");
+    if (!detector && "BarcodeDetector" in window) {
+      try {
+        const formats = await BarcodeDetector.getSupportedFormats();
+        if (formats.includes("qr_code")) detector = new BarcodeDetector({ formats: ["qr_code"] });
+      } catch (e) { detector = null; }
+    }
+    if (!detector && !window.jsQR) await loadJsQR();
+    loop();
+  }
+
+  function stopCamera() {
+    if (stream) stream.getTracks().forEach((t) => t.stop());
+    stream = null;
+  }
+
+  function showOverlay(text, withButton) {
+    $("overlayText").textContent = text;
+    $("startBtn").hidden = !withButton;
+    $("overlay").hidden = false;
+  }
+
+  function loadJsQR() {
+    return new Promise((resolve) => {
+      const s = document.createElement("script");
+      s.src = "/scan/jsQR.js";
+      s.onload = resolve;
+      s.onerror = () => { setMsg("Couldn't load the QR reader. Check the connection and reload.", "err"); resolve(); };
+      document.head.append(s);
+    });
+  }
+
+  const canvas = document.createElement("canvas");
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+
+  async function readOnce(video) {
+    if (detector) {
+      const codes = await detector.detect(video);
+      return codes[0] && codes[0].rawValue;
+    }
+    if (!window.jsQR) return null;
+    const scale = Math.min(1, 720 / Math.max(video.videoWidth, video.videoHeight));
+    canvas.width = Math.round(video.videoWidth * scale);
+    canvas.height = Math.round(video.videoHeight * scale);
+    ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+    const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
+    const code = jsQR(img.data, img.width, img.height, { inversionAttempts: "dontInvert" });
+    return code && code.data;
+  }
+
+  async function loop() {
+    if (!stream) return;
+    const video = $("video");
+    if (!paused && !busy && video.readyState >= 2 && video.videoWidth) {
+      try {
+        const value = await readOnce(video);
+        const now = Date.now();
+        if (value) {
+          if (value === last.value && now - last.at < SAME_VALUE_PAUSE_MS) {
+            last.at = now;                // still in view: keep ignoring it
+          } else {
+            last = { value, at: now };
+            send(value);
+          }
+        }
+      } catch (e) { /* a frame that couldn't be read; try the next one */ }
+    }
+    setTimeout(() => requestAnimationFrame(loop), 120);
+  }
+
+  // ── Wiring ────────────────────────────────────────────────────────────────
+  $("startBtn").addEventListener("click", startCamera);
+  $("flipBtn").addEventListener("click", () => {
+    facing = facing === "environment" ? "user" : "environment";
+    startCamera();
+  });
+  $("pauseBtn").addEventListener("click", () => {
+    paused = !paused;
+    $("pauseBtn").textContent = paused ? "Resume" : "Pause";
+    setMsg(paused ? "Paused. Nothing is scanned until you tap Resume." : "Point the camera at the permit QR.");
+  });
+  $("sendBtn").addEventListener("click", () => { send($("manual").value); $("manual").value = ""; });
+  $("manual").addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { send($("manual").value); $("manual").value = ""; }
+  });
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) stopCamera();
+    else if ($("overlay").hidden) startCamera();
+  });
+
+  // Tell the extension a phone joined, then try the camera straight away
+  // (browsers that need a tap first show the Start camera button instead).
+  push({ type: "hello" })
+    .then(() => setConn("Connected", "ok"))
+    .catch((err) => { setConn("Offline", "err"); setMsg(err.message, "err"); });
+  startCamera();
+})();
+</script>
+</body>
+</html>
