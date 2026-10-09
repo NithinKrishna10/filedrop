@@ -66,7 +66,13 @@ if STORAGE_BACKEND not in ('disk', 'blob'):
     raise RuntimeError("FILEDROP_STORAGE_BACKEND must be 'disk' or 'blob'")
 
 # Vercel's Blob REST API version header. Only change it if Vercel does.
+# Note 7, not the SDK's current 12: version 12 rejects these uploads, 7 accepts
+# them. Verified against a live private store.
 BLOB_API_VERSION = _env('FILEDROP_BLOB_API_VERSION', '7')
+
+# 'private' or 'public', and it has to match how the store was created -- the API
+# refuses a mismatch rather than adapting. Vercel's newer stores are private.
+BLOB_ACCESS = _env('FILEDROP_BLOB_ACCESS', 'private').strip().lower()
 
 # Where the zips land under the 'disk' backend. Point it at a mounted volume on
 # a host that wipes the project directory between deploys. Ignored for 'blob'.

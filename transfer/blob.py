@@ -109,6 +109,10 @@ def upload(name, data, content_type='application/zip'):
     """
     url = f'{BASE}/{urllib.parse.quote(name)}'
     headers = _headers({
+        # Must match how the store was created, or the API rejects the upload
+        # with "Cannot use public access on a private store". The header name
+        # comes from @vercel/blob, which sets it from its `access` option.
+        'x-vercel-blob-access': settings.BLOB_ACCESS,
         'x-content-type': content_type,
         # Keep the pathname exactly as given, so re-uploading backend-zip.zip
         # replaces it instead of creating backend-zip-<random>.zip and leaving
@@ -121,7 +125,11 @@ def upload(name, data, content_type='application/zip'):
     if hasattr(data, 'read'):
         data = data.read()
     headers['content-length'] = len(data)
-    return _as_file(_request('PUT', url, data=data, headers=headers))
+    stored = _as_file(_request('PUT', url, data=data, headers=headers))
+    # The PUT response carries no size, so report what we sent rather than null.
+    if stored.get("size") is None:
+        stored["size"] = len(data)
+    return stored
 
 
 def listing(prefix=''):

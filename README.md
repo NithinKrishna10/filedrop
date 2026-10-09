@@ -56,6 +56,7 @@ All via environment; see `.env.example`.
 | `FILEDROP_API_SECRET` | required |
 | `BLOB_READ_WRITE_TOKEN` | set by Vercel when a Blob store is linked; its presence selects the `blob` backend |
 | `FILEDROP_STORAGE_BACKEND` | `disk` or `blob`; inferred from the token above |
+| `FILEDROP_BLOB_ACCESS` | `private` (default) or `public`; must match how the store was created |
 | `FILEDROP_STORAGE_DIR` | default `./storage`; `disk` backend only |
 | `FILEDROP_MAX_UPLOAD_BYTES` | default 512 MB; `0` disables |
 | `FILEDROP_ALLOWED_EXT` | default `.zip`; empty allows any |

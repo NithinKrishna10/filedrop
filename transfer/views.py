@@ -306,5 +306,20 @@ def health(request):
             info["error"] = str(exc)
     else:
         info["storage_dir"] = str(settings.STORAGE_DIR)
-        info["storage_writable"] = os.access(str(_storage_dir()), os.W_OK)
+        try:
+            info["storage_writable"] = os.access(str(_storage_dir()), os.W_OK)
+        except OSError:
+            # mkdir itself fails on a read-only filesystem.
+            info["storage_writable"] = False
+        if not info["storage_writable"]:
+            # The common case is a serverless deploy with no Blob store linked.
+            # Saying so here saves guessing why uploads return 500.
+            info["ok"] = False
+            info["hint"] = (
+                "Storage is not writable and BLOB_READ_WRITE_TOKEN is not set, so "
+                "the backend fell back to 'disk'. Connect a Blob store to the "
+                "project and REDEPLOY - environment variables only reach new "
+                "deployments, so connecting a store does not affect one already "
+                "running."
+            )
     return JsonResponse(info)
